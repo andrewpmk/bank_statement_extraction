@@ -1,0 +1,4 @@
+pdfplumber==0.11.10
+pypdf==6.14.2
+pypdfium2==5.11.0
+pillow==12.3.0
