@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
-"""Convert TD chequing statement PDFs into accountactivity-YYYY-MM.csv using OpenRouter.
+"""Convert Meridian Credit Union savings statement PDFs into accountactivity CSVs using OpenRouter.
 
-This script extracts raw table rows with pdfplumber, then uses an AI model to
-normalize transaction rows and compute missing balances.
+This is adapted from the TD/Tangerine/Desjardins converters. Meridian statements print
+one "Deposit Accounts" table per account (this account only ever has one: Online
+Advantage Savings) with columns Date, Account Activity, Withdrawals, Deposits, Balance.
+Transaction dates are printed as full dates (DD-Mon-YYYY), so no month/year inference is
+needed the way TD/Tangerine's short "MONDD" dates require.
+
+Supported filename patterns (statement period is read from the filename):
+  MESTMT-MMDDYYYY-<account>-<seq>.pdf   (statement period ending date)
+  Meridian_YYYY-MM.pdf
+
+Output files are named: accountactivity_meridian_YYYY_MM.csv
+in the same row format as the other converters: Date, Description, Withdrawals, Deposits, Balance
+
+Default model: openai/gpt-4o-mini (cheap). Override with --model if needed.
 """
 
 from __future__ import annotations
@@ -25,7 +37,6 @@ try:
 except Exception:
     pdfium = None
 
-
 MONTH_TO_NUM = {
     "JAN": 1,
     "FEB": 2,
@@ -41,10 +52,12 @@ MONTH_TO_NUM = {
     "DEC": 12,
 }
 
-STATEMENT_FILENAME_RE = re.compile(
-    r"_(?P<start_mon>[A-Za-z]{3})_(?P<start_day>\d{2})-(?P<end_mon>[A-Za-z]{3})_(?P<end_day>\d{2})_(?P<end_year>\d{4})\.pdf$",
-    re.IGNORECASE,
+MESTMT_RE = re.compile(
+    r"MESTMT-(?P<month>\d{2})(?P<day>\d{2})(?P<year>\d{4})-\d+-\d+\.pdf$", re.IGNORECASE
 )
+MERIDIAN_NAME_MONTH_RE = re.compile(r"Meridian_(?P<year>\d{4})-(?P<month>\d{2})\.pdf$", re.IGNORECASE)
+
+MODEL = "openai/gpt-4o-mini"
 
 
 @dataclass
@@ -68,24 +81,19 @@ def load_dotenv(dotenv_path: Path) -> None:
         os.environ[key] = value
 
 
-def normalize_cell(value: str | None) -> str:
-    if value is None:
-        return ""
-    parts = [part.strip() for part in str(value).split("\n")]
-    parts = [part for part in parts if part]
-    return " ".join(parts)
-
-
 def normalize_description(value: str) -> str:
-    # Normalize spacing only: collapse multiple spaces while preserving content.
-    return re.sub(r"\s{2,}", " ", value).strip()
+    value = re.sub(r"\s*\n\s*", " ", value.strip())
+    return re.sub(r"\s{2,}", " ", value)
 
 
 def normalize_amount(value: str) -> str:
     value = value.strip()
     if not value:
         return ""
-    return value.replace(",", "")
+    value = value.replace(",", "")
+    # Meridian prints Withdrawals with a leading "-" as a visual cue; the column already
+    # means "money out", so the sign is not a real negative and must not be kept.
+    return value.lstrip("-")
 
 
 def canonical_desc_key(value: str) -> str:
@@ -93,23 +101,15 @@ def canonical_desc_key(value: str) -> str:
 
 
 def parse_statement_period(pdf_path: Path) -> StatementPeriod:
-    match = STATEMENT_FILENAME_RE.search(pdf_path.name)
+    match = MESTMT_RE.search(pdf_path.name) or MERIDIAN_NAME_MONTH_RE.search(pdf_path.name)
     if not match:
         raise ValueError(f"Unable to parse statement period from filename: {pdf_path.name}")
-
-    end_mon = match.group("end_mon").upper()
-    end_year = int(match.group("end_year"))
-    if end_mon not in MONTH_TO_NUM:
-        raise ValueError(f"Unrecognized end month in filename: {pdf_path.name}")
-
-    return StatementPeriod(end_month=MONTH_TO_NUM[end_mon], end_year=end_year)
+    return StatementPeriod(end_month=int(match.group("month")), end_year=int(match.group("year")))
 
 
 def render_pdf_pages_as_data_urls(pdf_path: Path, dpi: int = 300) -> list[str]:
     if pdfium is None:
-        raise RuntimeError(
-            "Missing dependency pypdfium2. Install requirements before running AI image extraction."
-        )
+        raise RuntimeError("Missing dependency pypdfium2. Install requirements before running AI image extraction.")
 
     data_urls: list[str] = []
     scale = dpi / 72.0
@@ -140,53 +140,49 @@ def render_pdf_pages_as_data_urls(pdf_path: Path, dpi: int = 300) -> list[str]:
     return data_urls
 
 
-def month_day_to_mmddyyyy(token: str, period: StatementPeriod) -> str:
+def parse_full_date(token: str) -> str:
     token = token.strip().upper()
-    m = re.fullmatch(r"([A-Z]{3})(\d{2})", token)
+    m = re.fullmatch(r"(\d{1,2})-([A-Z]{3})-(\d{4})", token)
     if not m:
         raise ValueError(f"Unrecognized transaction date token: {token}")
-
-    mon_abbr = m.group(1)
-    day = int(m.group(2))
+    day = int(m.group(1))
+    mon_abbr = m.group(2)
+    year = int(m.group(3))
     if mon_abbr not in MONTH_TO_NUM:
         raise ValueError(f"Unrecognized month abbreviation in date token: {token}")
-
-    month_num = MONTH_TO_NUM[mon_abbr]
-    year = period.end_year if month_num <= period.end_month else period.end_year - 1
-    return f"{month_num:02d}/{day:02d}/{year:04d}"
+    return f"{MONTH_TO_NUM[mon_abbr]:02d}/{day:02d}/{year:04d}"
 
 
-def build_prompt(period: StatementPeriod) -> str:
+def build_prompt() -> str:
     rules = (
-        "You extract TD statement transactions from page images. "
-        "Columns are Description, Withdrawals, Deposits, Date, Balance. "
-        "Rules: Each visible transaction row must become one output row. Do not merge adjacent rows. "
-        "If a description wraps across multiple lines within the same visible row, join only those lines. "
+        "You extract Meridian Credit Union savings statement transactions from page images. "
+        "The table is under a 'Deposit Accounts' heading with a "
+        "'Date Account Activity Withdrawals Deposits Balance' header row. "
+        "Each visible transaction row must become one output row. Do not merge adjacent rows. "
+        "A row's description sometimes wraps onto the next printed line with no date of its own "
+        "(e.g. a payee name like 'Tangerine' or 'PAYPAL PTE LTD' under a 'Pre-Authorized # ...' line); "
+        "join that continuation line into the Description of the row above it, it is not its own row. "
         "Description always populated for real transactions. "
         "Exactly one of Withdrawals/Deposits must be populated in output. "
-        "Date is always populated for output rows. "
+        "Withdrawals is always a positive magnitude: the statement sometimes prints a leading '-' before a "
+        "Withdrawals amount as a visual cue, but that is not a negative number, do not include the sign. "
+        "Date is always populated for output rows; it is printed as 'DD-Mon-YYYY', e.g. '31-Mar-2022'; "
+        "output it unchanged in that same 'DD-Mon-YYYY' format. "
         "If Balance is missing, compute running balance from prior known balance and amount. "
-        "Include STARTING BALANCE / BALANCE FORWARD rows when visible. "
-        "Ignore TOTAL summary rows. "
+        "Include the 'Balance Forward' row when visible, using Description 'Balance Forward'. "
+        "Ignore 'Account Totals' summary rows. "
         "Preserve spacing and punctuation in Description; do not rewrite text. "
         "Return ONLY JSON array. Each object must contain keys exactly: "
         "Description, Withdrawals, Deposits, Date, Balance. "
-        "Date must stay in MONDD format, e.g. MAY07. Amounts use plain decimals without commas."
+        "Amounts use plain decimals without commas."
     )
-    payload = {
-        "statement_period": {
-            "end_month": period.end_month,
-            "end_year": period.end_year,
-        }
-    }
-    return f"{rules}\n\nInput JSON:\n{json.dumps(payload, ensure_ascii=True)}"
+    return rules
 
 
 def extract_json_array(text: str) -> list[dict[str, str]]:
     text = text.strip()
     if text.startswith("["):
         return json.loads(text)
-
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         raise ValueError("Model response did not contain a JSON array.")
@@ -207,14 +203,8 @@ def call_openrouter(model: str, api_key: str, prompt: str, page_data_urls: list[
     body = {
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": "You output strict JSON only.",
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
+            {"role": "system", "content": "You output strict JSON only."},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0,
     }
@@ -222,10 +212,7 @@ def call_openrouter(model: str, api_key: str, prompt: str, page_data_urls: list[
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
 
@@ -244,49 +231,52 @@ def call_openrouter(model: str, api_key: str, prompt: str, page_data_urls: list[
         raise RuntimeError(f"Unexpected OpenRouter response: {data}") from exc
 
 
-def clean_ai_rows(
-    ai_rows: list[dict[str, str]],
-    period: StatementPeriod,
-) -> list[list[str]]:
+def _field(row: dict[str, object], key: str) -> str:
+    value = row.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def clean_ai_rows(ai_rows: list[dict[str, str]]) -> list[list[str]]:
     output_rows: list[list[str]] = []
     prev_balance: float | None = None
 
     for row in ai_rows:
-        desc = normalize_description(str(row.get("Description", "")))
-        wd = normalize_amount(str(row.get("Withdrawals", "")).strip())
-        dep = normalize_amount(str(row.get("Deposits", "")).strip())
-        date_token = str(row.get("Date", "")).strip().upper()
-        bal = normalize_amount(str(row.get("Balance", "")).strip())
+        desc = normalize_description(_field(row, "Description"))
+        wd = normalize_amount(_field(row, "Withdrawals"))
+        dep = normalize_amount(_field(row, "Deposits"))
+        date_token = _field(row, "Date")
+        bal = normalize_amount(_field(row, "Balance"))
 
-        if not desc or not date_token:
+        if not desc:
             continue
 
         compact = canonical_desc_key(desc)
-        if compact.startswith("TOTAL"):
+        if "TOTAL" in compact:
             continue
 
         if compact in {"STARTINGBALANCE", "BALANCEFORWARD"}:
-            mmddyyyy = month_day_to_mmddyyyy(date_token, period)
-
             cur_balance: float | None = None
             if bal:
                 try:
                     cur_balance = round(float(bal), 2)
                 except ValueError:
                     cur_balance = None
-
             if cur_balance is None:
                 continue
-
             prev_balance = cur_balance
+            continue
+
+        if not date_token:
             continue
 
         if bool(wd) == bool(dep):
             continue
 
-        mmddyyyy = month_day_to_mmddyyyy(date_token, period)
+        mmddyyyy = parse_full_date(date_token)
 
-        cur_balance: float | None = None
+        cur_balance = None
         if bal:
             try:
                 cur_balance = round(float(bal), 2)
@@ -305,22 +295,14 @@ def clean_ai_rows(
         if cur_balance is None:
             continue
 
-        output_rows.append(
-            [
-                mmddyyyy,
-                desc,
-                wd,
-                dep,
-                f"{cur_balance:.2f}",
-            ]
-        )
+        output_rows.append([mmddyyyy, desc, wd, dep, f"{cur_balance:.2f}"])
         prev_balance = cur_balance
 
     return output_rows
 
 
 def output_csv_path(pdf_path: Path, period: StatementPeriod, output_dir: Path | None) -> Path:
-    filename = f"accountactivity-{period.end_year:04d}-{period.end_month:02d}.csv"
+    filename = f"accountactivity_meridian_{period.end_year:04d}_{period.end_month:02d}.csv"
     if output_dir:
         return output_dir / filename
     return pdf_path.parent / filename
@@ -329,10 +311,10 @@ def output_csv_path(pdf_path: Path, period: StatementPeriod, output_dir: Path | 
 def convert_file(pdf_path: Path, output_dir: Path | None, model: str, api_key: str, timeout_s: int) -> Path:
     period = parse_statement_period(pdf_path)
     page_data_urls = render_pdf_pages_as_data_urls(pdf_path)
-    prompt = build_prompt(period)
+    prompt = build_prompt()
     model_text = call_openrouter(model, api_key, prompt, page_data_urls, timeout_s)
     ai_rows = extract_json_array(model_text)
-    out_rows = clean_ai_rows(ai_rows, period)
+    out_rows = clean_ai_rows(ai_rows)
 
     out_path = output_csv_path(pdf_path, period, output_dir)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,12 +329,10 @@ def find_pdfs(root: Path) -> list[Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Convert TD chequing statement PDFs with OpenRouter-assisted table normalization.",
-    )
+    parser = argparse.ArgumentParser(description="Convert Meridian statement PDFs with OpenRouter-assisted table normalization.")
     parser.add_argument("--input", default=".", help="Root folder to scan for statement PDFs.")
     parser.add_argument("--output-dir", default=None, help="Optional output folder for CSV files.")
-    parser.add_argument("--model", default="openai/gpt-4o-mini", help="OpenRouter model id.")
+    parser.add_argument("--model", default=MODEL, help="OpenRouter model id.")
     parser.add_argument("--timeout", type=int, default=120, help="OpenRouter timeout in seconds.")
     parser.add_argument("--dotenv", default=".env", help="Path to .env file containing OPENROUTER_API_KEY.")
     parser.add_argument("--fail-fast", action="store_true", help="Stop on first file conversion error.")

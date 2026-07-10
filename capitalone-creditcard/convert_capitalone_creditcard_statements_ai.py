@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Capital One credit card statement PDFs into CSVs using OpenRouter (model default: openai/gpt-5-mini).
+"""Convert Capital One credit card statement PDFs into CSVs using OpenRouter (model default: openai/gpt-4o-mini).
 
 Output files are named: capitalone_YYYYMMDD_YYYYMMDD.csv (start/end dates from PDF or filename).
 
@@ -383,10 +383,10 @@ def convert_file(pdf: Path, output_dir: Path | None, model: str, api_key: str, t
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Convert Capital One credit card statement PDFs with OpenRouter-assisted parsing (default: openai/gpt-5-mini).")
+    parser = argparse.ArgumentParser(description="Convert Capital One credit card statement PDFs with OpenRouter-assisted parsing (default: openai/gpt-4o-mini).")
     parser.add_argument("--input", default=".", help="PDF file or root folder to scan for statement PDFs.")
     parser.add_argument("--output-dir", default=None, help="Optional output folder for CSV files.")
-    parser.add_argument("--model", default="openai/gpt-5-mini", help="OpenRouter model id (default: openai/gpt-5-mini).")
+    parser.add_argument("--model", default="openai/gpt-4o-mini", help="OpenRouter model id (default: openai/gpt-4o-mini).")
     parser.add_argument("--timeout", type=int, default=120, help="OpenRouter timeout in seconds.")
     parser.add_argument("--dotenv", default=".env", help="Path to .env file containing OPENROUTER_API_KEY.")
     parser.add_argument("--fail-fast", action="store_true", help="Stop on first file conversion error.")

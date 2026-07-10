@@ -320,7 +320,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Convert Tangerine statement PDFs with OpenRouter-assisted table normalization.")
     parser.add_argument("--input", default=".", help="Root folder to scan for statement PDFs.")
     parser.add_argument("--output-dir", default=None, help="Optional output folder for CSV files.")
-    parser.add_argument("--model", default="openai/gpt-5-mini", help="OpenRouter model id.")
+    parser.add_argument("--model", default="openai/gpt-4o-mini", help="OpenRouter model id.")
     parser.add_argument("--timeout", type=int, default=120, help="OpenRouter timeout in seconds.")
     parser.add_argument("--dotenv", default=".env", help="Path to .env file containing OPENROUTER_API_KEY.")
     parser.add_argument("--fail-fast", action="store_true", help="Stop on first file conversion error.")

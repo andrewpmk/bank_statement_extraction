@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Convert TD chequing statement PDFs into accountactivity-YYYY-MM.csv using OpenRouter.
+"""Convert Desjardins chequing statement PDFs into accountactivity CSVs using OpenRouter.
 
-This script extracts raw table rows with pdfplumber, then uses an AI model to
-normalize transaction rows and compute missing balances.
+This is adapted from the TD/Tangerine converters. Desjardins statements pack multiple
+account sections onto one page (PCA chequing, SHR shares, sometimes a TS term savings
+account). This script extracts only the PCA chequing/everyday-transaction-account
+section and ignores the others.
+
+Supported filename patterns (statement period is read from the filename):
+  Desjardins_YYYY-MM.pdf
+  releve_<institution>-<transit>-<folio>-YYYYMM01.pdf
+
+Output files are named: accountactivity_desjardins_YYYY_MM.csv
+in the same row format as the TD/Tangerine converters: Date, Description, Withdrawals, Deposits, Balance
 """
 
 from __future__ import annotations
@@ -25,7 +34,6 @@ try:
 except Exception:
     pdfium = None
 
-
 MONTH_TO_NUM = {
     "JAN": 1,
     "FEB": 2,
@@ -41,10 +49,8 @@ MONTH_TO_NUM = {
     "DEC": 12,
 }
 
-STATEMENT_FILENAME_RE = re.compile(
-    r"_(?P<start_mon>[A-Za-z]{3})_(?P<start_day>\d{2})-(?P<end_mon>[A-Za-z]{3})_(?P<end_day>\d{2})_(?P<end_year>\d{4})\.pdf$",
-    re.IGNORECASE,
-)
+DESJARDINS_NAME_MONTH_RE = re.compile(r"Desjardins_(?P<year>\d{4})-(?P<month>\d{2})\.pdf$", re.IGNORECASE)
+DESJARDINS_RELEVE_RE = re.compile(r"releve_.*-(?P<year>\d{4})(?P<month>\d{2})\d{2}\.pdf$", re.IGNORECASE)
 
 
 @dataclass
@@ -68,23 +74,16 @@ def load_dotenv(dotenv_path: Path) -> None:
         os.environ[key] = value
 
 
-def normalize_cell(value: str | None) -> str:
-    if value is None:
-        return ""
-    parts = [part.strip() for part in str(value).split("\n")]
-    parts = [part for part in parts if part]
-    return " ".join(parts)
-
-
 def normalize_description(value: str) -> str:
-    # Normalize spacing only: collapse multiple spaces while preserving content.
-    return re.sub(r"\s{2,}", " ", value).strip()
+    return re.sub(r"\s{2,}", " ", value.strip())
 
 
 def normalize_amount(value: str) -> str:
     value = value.strip()
     if not value:
         return ""
+    # Desjardins amounts may use a space as a thousands separator (e.g. "2 147.73").
+    value = value.replace(" ", "").replace(" ", "")
     return value.replace(",", "")
 
 
@@ -93,23 +92,15 @@ def canonical_desc_key(value: str) -> str:
 
 
 def parse_statement_period(pdf_path: Path) -> StatementPeriod:
-    match = STATEMENT_FILENAME_RE.search(pdf_path.name)
+    match = DESJARDINS_NAME_MONTH_RE.search(pdf_path.name) or DESJARDINS_RELEVE_RE.search(pdf_path.name)
     if not match:
         raise ValueError(f"Unable to parse statement period from filename: {pdf_path.name}")
-
-    end_mon = match.group("end_mon").upper()
-    end_year = int(match.group("end_year"))
-    if end_mon not in MONTH_TO_NUM:
-        raise ValueError(f"Unrecognized end month in filename: {pdf_path.name}")
-
-    return StatementPeriod(end_month=MONTH_TO_NUM[end_mon], end_year=end_year)
+    return StatementPeriod(end_month=int(match.group("month")), end_year=int(match.group("year")))
 
 
 def render_pdf_pages_as_data_urls(pdf_path: Path, dpi: int = 300) -> list[str]:
     if pdfium is None:
-        raise RuntimeError(
-            "Missing dependency pypdfium2. Install requirements before running AI image extraction."
-        )
+        raise RuntimeError("Missing dependency pypdfium2. Install requirements before running AI image extraction.")
 
     data_urls: list[str] = []
     scale = dpi / 72.0
@@ -142,15 +133,13 @@ def render_pdf_pages_as_data_urls(pdf_path: Path, dpi: int = 300) -> list[str]:
 
 def month_day_to_mmddyyyy(token: str, period: StatementPeriod) -> str:
     token = token.strip().upper()
-    m = re.fullmatch(r"([A-Z]{3})(\d{2})", token)
+    m = re.fullmatch(r"([A-Z]{3})(\d{1,2})", token)
     if not m:
         raise ValueError(f"Unrecognized transaction date token: {token}")
-
     mon_abbr = m.group(1)
     day = int(m.group(2))
     if mon_abbr not in MONTH_TO_NUM:
         raise ValueError(f"Unrecognized month abbreviation in date token: {token}")
-
     month_num = MONTH_TO_NUM[mon_abbr]
     year = period.end_year if month_num <= period.end_month else period.end_year - 1
     return f"{month_num:02d}/{day:02d}/{year:04d}"
@@ -158,27 +147,31 @@ def month_day_to_mmddyyyy(token: str, period: StatementPeriod) -> str:
 
 def build_prompt(period: StatementPeriod) -> str:
     rules = (
-        "You extract TD statement transactions from page images. "
-        "Columns are Description, Withdrawals, Deposits, Date, Balance. "
-        "Rules: Each visible transaction row must become one output row. Do not merge adjacent rows. "
+        "You extract Desjardins chequing statement transactions from page images. "
+        "The statement contains multiple account sections stacked on the page, each starting "
+        "with an account header row (e.g. 'PCA PERSONAL CHEQUING ACCOUNT' or 'PCA EVERYDAY TRANSACTION ACCOUNT') "
+        "followed by a 'Date Code Description Charges Withdrawal Deposit Balance' header row. "
+        "ONLY extract rows from the PCA chequing/everyday-transaction account section. "
+        "Stop before the next account section (e.g. 'SAVINGS AND INVESTMENT ACCOUNT', 'SHR SHARES', 'TS ... Term Savings') "
+        "and ignore its rows entirely. "
+        "Each visible transaction row in the PCA section must become one output row. Do not merge adjacent rows. "
         "If a description wraps across multiple lines within the same visible row, join only those lines. "
         "Description always populated for real transactions. "
+        "The Code column (e.g. TMO, DW, ADM, REB) is metadata, not part of Description; do not include it. "
+        "If a row has a value in the Charges column and no value in Withdrawal or Deposit, treat the Charges "
+        "amount as a Withdrawal (charges reduce the balance). "
         "Exactly one of Withdrawals/Deposits must be populated in output. "
-        "Date is always populated for output rows. "
+        "Date is always populated for output rows; it appears as 'MON DD' (e.g. 'SEP 25') on the statement — "
+        "output it with no space as MONDD, e.g. SEP25. "
+        "Amounts may be printed with a space as a thousands separator (e.g. '2 147.73'); output plain decimals "
+        "with no thousands separators, e.g. 2147.73. "
         "If Balance is missing, compute running balance from prior known balance and amount. "
-        "Include STARTING BALANCE / BALANCE FORWARD rows when visible. "
-        "Ignore TOTAL summary rows. "
-        "Preserve spacing and punctuation in Description; do not rewrite text. "
+        "Include the 'Balance forward' row for the PCA section when visible, using Description 'Balance forward'. "
         "Return ONLY JSON array. Each object must contain keys exactly: "
         "Description, Withdrawals, Deposits, Date, Balance. "
-        "Date must stay in MONDD format, e.g. MAY07. Amounts use plain decimals without commas."
+        "Date must stay in MONDD format, e.g. SEP25. Amounts use plain decimals without commas or spaces."
     )
-    payload = {
-        "statement_period": {
-            "end_month": period.end_month,
-            "end_year": period.end_year,
-        }
-    }
+    payload = {"statement_period": {"end_month": period.end_month, "end_year": period.end_year}}
     return f"{rules}\n\nInput JSON:\n{json.dumps(payload, ensure_ascii=True)}"
 
 
@@ -186,7 +179,6 @@ def extract_json_array(text: str) -> list[dict[str, str]]:
     text = text.strip()
     if text.startswith("["):
         return json.loads(text)
-
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         raise ValueError("Model response did not contain a JSON array.")
@@ -207,14 +199,8 @@ def call_openrouter(model: str, api_key: str, prompt: str, page_data_urls: list[
     body = {
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": "You output strict JSON only.",
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
+            {"role": "system", "content": "You output strict JSON only."},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0,
     }
@@ -222,10 +208,7 @@ def call_openrouter(model: str, api_key: str, prompt: str, page_data_urls: list[
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
 
@@ -244,21 +227,25 @@ def call_openrouter(model: str, api_key: str, prompt: str, page_data_urls: list[
         raise RuntimeError(f"Unexpected OpenRouter response: {data}") from exc
 
 
-def clean_ai_rows(
-    ai_rows: list[dict[str, str]],
-    period: StatementPeriod,
-) -> list[list[str]]:
+def _field(row: dict[str, object], key: str) -> str:
+    value = row.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def clean_ai_rows(ai_rows: list[dict[str, str]], period: StatementPeriod) -> list[list[str]]:
     output_rows: list[list[str]] = []
     prev_balance: float | None = None
 
     for row in ai_rows:
-        desc = normalize_description(str(row.get("Description", "")))
-        wd = normalize_amount(str(row.get("Withdrawals", "")).strip())
-        dep = normalize_amount(str(row.get("Deposits", "")).strip())
-        date_token = str(row.get("Date", "")).strip().upper()
-        bal = normalize_amount(str(row.get("Balance", "")).strip())
+        desc = normalize_description(_field(row, "Description"))
+        wd = normalize_amount(_field(row, "Withdrawals"))
+        dep = normalize_amount(_field(row, "Deposits"))
+        date_token = _field(row, "Date").upper()
+        bal = normalize_amount(_field(row, "Balance"))
 
-        if not desc or not date_token:
+        if not desc:
             continue
 
         compact = canonical_desc_key(desc)
@@ -266,19 +253,19 @@ def clean_ai_rows(
             continue
 
         if compact in {"STARTINGBALANCE", "BALANCEFORWARD"}:
-            mmddyyyy = month_day_to_mmddyyyy(date_token, period)
-
+            # Desjardins "Balance forward" rows carry no date; only real transactions need one.
             cur_balance: float | None = None
             if bal:
                 try:
                     cur_balance = round(float(bal), 2)
                 except ValueError:
                     cur_balance = None
-
             if cur_balance is None:
                 continue
-
             prev_balance = cur_balance
+            continue
+
+        if not date_token:
             continue
 
         if bool(wd) == bool(dep):
@@ -286,7 +273,7 @@ def clean_ai_rows(
 
         mmddyyyy = month_day_to_mmddyyyy(date_token, period)
 
-        cur_balance: float | None = None
+        cur_balance = None
         if bal:
             try:
                 cur_balance = round(float(bal), 2)
@@ -305,22 +292,14 @@ def clean_ai_rows(
         if cur_balance is None:
             continue
 
-        output_rows.append(
-            [
-                mmddyyyy,
-                desc,
-                wd,
-                dep,
-                f"{cur_balance:.2f}",
-            ]
-        )
+        output_rows.append([mmddyyyy, desc, wd, dep, f"{cur_balance:.2f}"])
         prev_balance = cur_balance
 
     return output_rows
 
 
 def output_csv_path(pdf_path: Path, period: StatementPeriod, output_dir: Path | None) -> Path:
-    filename = f"accountactivity-{period.end_year:04d}-{period.end_month:02d}.csv"
+    filename = f"accountactivity_desjardins_{period.end_year:04d}_{period.end_month:02d}.csv"
     if output_dir:
         return output_dir / filename
     return pdf_path.parent / filename
@@ -347,9 +326,7 @@ def find_pdfs(root: Path) -> list[Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Convert TD chequing statement PDFs with OpenRouter-assisted table normalization.",
-    )
+    parser = argparse.ArgumentParser(description="Convert Desjardins statement PDFs with OpenRouter-assisted table normalization.")
     parser.add_argument("--input", default=".", help="Root folder to scan for statement PDFs.")
     parser.add_argument("--output-dir", default=None, help="Optional output folder for CSV files.")
     parser.add_argument("--model", default="openai/gpt-4o-mini", help="OpenRouter model id.")
